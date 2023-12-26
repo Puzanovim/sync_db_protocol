@@ -1,6 +1,4 @@
 import asyncio
-from contextlib import contextmanager
-from sqlite3 import Cursor, connect
 from uuid import uuid4, UUID
 from multiprocessing import Process
 
@@ -10,16 +8,9 @@ from schemas import Address
 import logging
 
 from src.app.commands import ANSWER_COMMAND
-from src.app.exceptions import NodeNotFound
+from src.app.repositories.nodes_repo import NodeRepository
 
 logger = logging.getLogger(__name__)
-
-
-def bin_to_hex(value) -> str:
-    if isinstance(value, bytes):
-        return value.hex()
-
-    return value
 
 
 class Server(Process):
@@ -30,16 +21,11 @@ class Server(Process):
         self.uuid: UUID = uuid4()
         self.__timeout: int = 10
 
-        self._db_address = f'db_data/{self.name}_{self.uuid}.db'
-        self.__init_db()
-        # self.nodes_db = NodeRepository(f'{self.name}_{self.uuid}')
-        # self.nodes_db.connect()
-
-    # def get_nodes(self) -> dict[UUID, Address]:
-    #     return self.nodes_db.get_nodes()
+        self.nodes_db = NodeRepository(f'db_data/{self.name}_{self.uuid}.db')
+        self.nodes_db.init_db()
 
     def info_nodes(self) -> dict:
-        return {'name': self.name, 'uuid': self.uuid, 'nodes': self.get_nodes()}
+        return {'name': self.name, 'uuid': self.uuid, 'nodes': self.nodes_db.get_nodes()}
 
     async def __send_receive(self, message: dict, node_address: Address) -> dict:
         reader, writer = await asyncio.open_connection(node_address.address, node_address.port)
@@ -72,7 +58,7 @@ class Server(Process):
             return None
 
         new_node_id = message.get('UUID')
-        nodes = self.get_nodes()
+        nodes = self.nodes_db.get_nodes()
 
         message: dict = {
             'UUID': self.uuid,
@@ -99,7 +85,7 @@ class Server(Process):
             except TimeoutError:
                 continue
 
-        self.insert_node(new_node_id, new_node_address)
+        self.nodes_db.insert_node(new_node_id, new_node_address)
 
     async def commit_transaction(self, transaction: str):
         transaction_id: UUID = uuid4()
@@ -137,17 +123,17 @@ class Server(Process):
                 node_id = message.get('UUID')
                 message_data = message.get('data')
                 node_address = Address.model_validate(orjson.loads(message_data.get('node_address')))
-                self.insert_node(node_id, node_address)
+                self.nodes_db.insert_node(node_id, node_address)
 
                 nodes = message_data.get('nodes', {})
                 for uuid, address in nodes.items():
-                    self.insert_node(uuid, Address.model_validate(orjson.loads(address)))
+                    self.nodes_db.insert_node(uuid, Address.model_validate(orjson.loads(address)))
 
                 answer_data = None
             case 'JOIN_NODE':
                 node_id = message.get('UUID_NEW_NODE')
                 node_address = Address.model_validate(orjson.loads(message.get('data').get('node_address')))
-                self.insert_node(node_id, node_address)
+                self.nodes_db.insert_node(node_id, node_address)
                 answer_data = None
 
         message: dict = {
@@ -173,107 +159,3 @@ class Server(Process):
     def run(self):
         logger.warning(f'Starting server with id: {self.uuid} address: {self.address}')
         asyncio.run(self.start_server())
-
-    @contextmanager
-    def transaction(self):
-        connection = connect(self._db_address)
-        try:
-            with connection as conn:
-                yield conn.cursor()
-        except Exception as exc:
-            logger.warning(f'Exception found: {exc}')
-            connection.rollback()
-        else:
-            connection.commit()
-        finally:
-            connection.close()
-
-    def __init_db(self) -> None:
-        with self.transaction() as cursor:
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS node (
-                id INTEGER PRIMARY KEY,
-                node TEXT NOT NULL,
-                address TEXT NOT NULL
-            )
-            ''')
-            cursor.close()
-
-    def get_address_by_node(self, node: UUID) -> Address:
-        with self.transaction() as cursor:
-            cursor.execute(
-                """
-                SELECT `address` FROM node WHERE node = :node
-                LIMIT 1
-            """,
-                {"node": str(node)},
-            )
-            result = cursor.fetchone()
-            cursor.close()
-
-        if result is None:
-            raise NodeNotFound
-
-        (address_str,) = result
-
-        return Address.model_validate(address_str)
-
-    def get_nodes(self) -> dict[str, Address]:
-        with self.transaction() as cursor:
-            cursor.execute(
-                """
-                    SELECT id, node, address FROM node
-                """
-            )
-
-            # data = {row[1]: row[2] for row in cursor.fetchall()}
-            # print(data)
-            return {row[1]: Address.model_validate(orjson.loads(row[2])) for row in cursor.fetchall()}
-        #     cursor.close()
-        #
-        # print(result)
-        # return result
-
-    def get_node_by_address(self, address: Address) -> str:
-        address_str: str = self._dumps_dict(address.model_dump_json())
-
-        with self.transaction() as cursor:
-            cursor.execute(
-                """
-                SELECT `node` FROM node WHERE address = :address
-                LIMIT 1
-            """,
-                {"address": address_str},
-            )
-            result = cursor.fetchone()
-            cursor.close()
-
-        if result is None:
-            raise NodeNotFound
-
-        (node_id,) = result
-
-        return node_id
-
-    def insert_node(self, node: str, address: Address) -> int:
-        address_str: str = self._dumps_dict(address.model_dump_json())
-
-        with self.transaction() as cursor:
-            result: Cursor = cursor.execute(
-                """
-                INSERT INTO node 
-                    (node, address)
-                VALUES 
-                    (:node, :address)
-            """,
-                {"node": str(node), "address": address_str},
-            )
-            cursor.close()
-
-        return result.lastrowid
-
-    def _dumps_dict(self, some_dict: str | dict) -> str:
-        if isinstance(some_dict, str):
-            return some_dict
-
-        return str(orjson.dumps(some_dict, default=bin_to_hex))
