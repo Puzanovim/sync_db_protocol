@@ -43,7 +43,8 @@ class NodeRepository:
             CREATE TABLE IF NOT EXISTS node (
                 id INTEGER PRIMARY KEY,
                 node TEXT NOT NULL,
-                address TEXT NOT NULL
+                address TEXT NOT NULL,
+                failure_count INTEGER NOT NULL
             )
             ''')
             cursor.close()
@@ -66,6 +67,25 @@ class NodeRepository:
         (address_str,) = result
 
         return Address.model_validate(address_str)
+
+    def get_node_failure_count(self, node: str) -> int:
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT `failure_count` FROM node WHERE node = :node
+                LIMIT 1
+            """,
+                {"node": node},
+            )
+            result = cursor.fetchone()
+            cursor.close()
+
+        if result is None:
+            raise NodeNotFound
+
+        (failure_count,) = result
+
+        return failure_count
 
     def get_nodes(self) -> dict[str, Address]:
         with self.transaction() as cursor:
@@ -104,15 +124,37 @@ class NodeRepository:
             result: Cursor = cursor.execute(
                 """
                 INSERT INTO node 
-                    (node, address)
+                    (node, address, failure_count)
                 VALUES 
-                    (:node, :address)
+                    (:node, :address, :failure_count)
             """,
-                {"node": str(node), "address": address_str},
+                {"node": str(node), "address": address_str, "failure_count": 0},
             )
             cursor.close()
 
         return result.lastrowid
+
+    def update_node_failure_count(self, node_id: str, failure_count: int):
+        with self.transaction() as cursor:
+            result: Cursor = cursor.execute(
+                """
+                UPDATE node SET failure_count = :failure_count WHERE node = :node
+                """,
+                {"node": node_id, "failure_count": failure_count},
+            )
+            cursor.close()
+
+        return result.lastrowid
+
+    def delete_node(self, node_id: str) -> None:
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM node WHERE node = :node
+                """,
+                {"node": node_id},
+            )
+            cursor.close()
 
     def _dumps_dict(self, some_dict: str | dict) -> str:
         if isinstance(some_dict, str):

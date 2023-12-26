@@ -8,9 +8,17 @@ from schemas import Address
 import logging
 
 from src.app.commands import ANSWER_COMMAND
+from src.app.config import CustomFormatter
 from src.app.repositories.nodes_repo import NodeRepository
+from src.app.repositories.transactions_repo import TransactionsRepository
+
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+ch.setFormatter(CustomFormatter())
+logger.addHandler(ch)
 
 
 class Server(Process):
@@ -20,17 +28,44 @@ class Server(Process):
         self.address: Address = address
         self.uuid: UUID = uuid4()
         self.__timeout: int = 10
+        self.__failure_count: int = 5
 
-        self.nodes_db = NodeRepository(f'db_data/{self.name}_{self.uuid}.db')
+        self.__client_indent = '\t\t\t\t\t\t\t'
+        self.__len_command_field = 15
+
+        self.nodes_db = NodeRepository(f'db_data/nodes/{self.name}_{self.uuid}.db')
         self.nodes_db.init_db()
 
+        self.transactions_db = TransactionsRepository(f'db_data/transactions/{self.name}_{self.uuid}.db')
+        try:
+            self.transactions_db.init_db()
+        except Exception as exc:
+            logger.exception(exc)
+
     def info_nodes(self) -> dict:
-        return {'name': self.name, 'uuid': self.uuid, 'nodes': self.nodes_db.get_nodes()}
+        return {
+            'name': self.name,
+            'uuid': self.uuid,
+            'nodes': self.nodes_db.get_nodes(),
+            'transactions': self.transactions_db.get_transactions(),
+        }
+
+    def server_log(self, command: str, addr: Address, msg: dict, received: bool) -> None:
+        action = 'Received.' if received else 'Send.    '
+        direction = 'From' if received else 'To  '
+        command_field = f'{command}{' ' * (self.__len_command_field - len(command))}'
+        logger.error(f'{self.name}:{action} {command_field}{direction} {addr}.{self.__client_indent}\t\t\t\t({msg})')
+
+    def client_log(self, command: str, addr: str, msg: dict, received: bool) -> None:
+        action = 'Received.' if received else 'Send.    '
+        direction = 'From' if received else 'To  '
+        command_field = f'{command}{' ' * (self.__len_command_field - len(command))}'
+        logger.warning(f'{self.__client_indent}{self.name}:{action} {command_field}{direction} {addr}.\t\t\t({msg})')
 
     async def __send_receive(self, message: dict, node_address: Address) -> dict:
         reader, writer = await asyncio.open_connection(node_address.address, node_address.port)
 
-        logger.warning(f'{self.name}:Send.     {message['COMMAND']}.\tTo {node_address}.\t\t\t\t\t\t\t({message})')
+        self.server_log(message['COMMAND'], node_address, message, received=False)
         writer.write(orjson.dumps(message))
 
         try:
@@ -40,7 +75,7 @@ class Server(Process):
             raise TimeoutError
         else:
             message = orjson.loads(data)
-            logger.warning(f'{self.name}:Received. {message['COMMAND']}.\tFrom {node_address}.\t\t\t\t\t\t\t({message})')
+            self.server_log(message['COMMAND'], node_address, message, received=True)
             return message
         finally:
             writer.close()
@@ -87,32 +122,137 @@ class Server(Process):
 
         self.nodes_db.insert_node(new_node_id, new_node_address)
 
+    async def abort_process(self, message: dict, nodes: list[Address]) -> None:
+        message: dict = {
+            **message,
+            'COMMAND': 'ABORT',
+        }
+        for node_address in nodes:
+            try:
+                await self.__send_receive(message, node_address)
+            except TimeoutError:
+                continue
+
+    async def delete_node(self, deleted_node_id: str, deleted_node_address: Address) -> None:
+        message: dict = {
+            'UUID': self.uuid,
+            'UUID_NODE': deleted_node_id,
+            'COMMAND': 'DELETE_NODE',
+            'data': None,
+        }
+        try:
+            await self.__send_receive(message, deleted_node_address)
+        except TimeoutError:
+            pass
+
+        nodes = self.nodes_db.get_nodes()
+
+        message: dict = {
+            'UUID': self.uuid,
+            'UUID_NODE': deleted_node_id,
+            'COMMAND': 'DELETE_NODE',
+            'data': None,
+        }
+        for node_id, node_address in nodes.items():
+            if node_address.address == deleted_node_address.address and node_address.port == deleted_node_address.port:
+                continue
+
+            try:
+                message = await self.__send_receive(message, node_address)
+            except TimeoutError:
+                pass
+
+        self.nodes_db.delete_node(deleted_node_id)
+
+    async def timeout_node_handler(self, node_id: str, node_address: Address) -> None:
+        failure_count = self.nodes_db.get_node_failure_count(node_id)
+        if failure_count > self.__failure_count:
+            await self.delete_node(node_id, node_address)
+        else:
+            self.nodes_db.update_node_failure_count(node_id, failure_count + 1)
+
     async def commit_transaction(self, transaction: str):
         transaction_id: UUID = uuid4()
+        nodes = self.nodes_db.get_nodes()
 
-        # reader, writer = await asyncio.open_connection(node_address.address, node_address.port)
-        #
-        # message: dict = {
-        #     'UUID_NODE': self.uuid,
-        #     'UUID_NEW_NODE': transaction_id,
-        #     'COMMAND': 'REQUEST_JOIN',
-        #     'data': None,
-        # }
-        #
-        # print(f'Send: {message!r}')
-        # writer.write(orjson.dumps(message))
-        #
-        # data = await reader.read(100)
-        # print(f'Received: {data.decode()!r}')
-        #
-        # print('Close the connection')
-        # writer.close()
+        self.transactions_db.insert_transaction(transaction_id, self.uuid, 'PREPARE', transaction)
+        check_result, check_text = self.transactions_db.check_transaction(transaction)
+        if not check_result:
+            self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+            logger.warning(f'{self.name}. Transaction denied: {check_text}')
+            return None
+
+        message: dict = {
+            'UUID': self.uuid,
+            'GTID': transaction_id,
+            'COMMAND': 'PREPARE',
+            'data': {'transaction': transaction},
+        }
+        sent_nodes = []
+        for node_id, node_address in nodes.items():
+            try:
+                answer_message = await self.__send_receive(message, node_address)
+            except TimeoutError:
+                self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                await self.abort_process(message, sent_nodes)
+                await self.timeout_node_handler(node_id, node_address)
+                return None
+            else:
+                if answer_message['COMMAND'] == 'DENY':
+                    self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                    await self.abort_process(message, sent_nodes)
+                    return None
+                self.transactions_db.update_transaction_state(transaction_id, answer_message['COMMAND'])
+                sent_nodes.append(node_address)
+
+        self.transactions_db.update_transaction_state(transaction_id, 'PRECOMMIT')
+        message: dict = {
+            'UUID': self.uuid,
+            'GTID': transaction_id,
+            'COMMAND': 'PRECOMMIT',
+            'data': {'transaction': transaction},
+        }
+        sent_nodes = []
+        for node_id, node_address in nodes.items():
+            try:
+                answer_message = await self.__send_receive(message, node_address)
+            except TimeoutError:
+                self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                await self.abort_process(message, sent_nodes)
+                await self.timeout_node_handler(node_id, node_address)
+                return None
+            else:
+                if answer_message['COMMAND'] == 'DENY':
+                    self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                    await self.abort_process(message, sent_nodes)
+                    return None
+                self.transactions_db.update_transaction_state(transaction_id, answer_message['COMMAND'])
+                sent_nodes.append(node_address)
+
+        self.transactions_db.save_to_binlog(transaction_id, transaction)
+
+        self.transactions_db.update_transaction_state(transaction_id, 'COMMIT')
+        message: dict = {
+            'UUID': self.uuid,
+            'GTID': transaction_id,
+            'COMMAND': 'COMMIT',
+            'data': None,
+        }
+        for node_id, node_address in nodes.items():
+            try:
+                await self.__send_receive(message, node_address)
+            except TimeoutError:
+                await self.timeout_node_handler(node_id, node_address)
+
+        self.transactions_db.update_transaction_state(transaction_id, 'COMMITED')
+        self.transactions_db.commit_transaction(transaction_id)
+        logger.exception(f'{self.name}. Transaction commited.', exc_info=False)
 
     async def handle_commands(self, reader, writer):
         data = await reader.read(1000)
         message = orjson.loads(data)
         addr = writer.get_extra_info('peername')
-        logger.warning(f'\t\t\t\t{self.name}. Received\t{message['COMMAND']}.\tFrom {addr}.\t\t({message})')
+        self.client_log(message['COMMAND'], addr, message, received=True)
 
         command = message.get('COMMAND')
         answer_command = ANSWER_COMMAND.get(command, 'UNKNOWN')
@@ -136,13 +276,57 @@ class Server(Process):
                 self.nodes_db.insert_node(node_id, node_address)
                 answer_data = None
 
+            case 'DELETE_NODE':
+                node_id = message.get('UUID_NEW_NODE')
+                if node_id != self.uuid:
+                    self.nodes_db.delete_node(node_id)
+
+            case 'PREPARE':
+                transaction_id = message.get('GTID')
+                transaction = message.get('data').get('transaction')
+                self.transactions_db.insert_transaction(transaction_id, self.uuid, command, transaction)
+                check_result, check_text = self.transactions_db.check_transaction(transaction)
+                if not check_result:
+                    logger.warning(f'{self.__client_indent}{self.name}. Transaction denied: {check_text}')
+                    self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                    answer_command = 'DENY'
+                else:
+                    self.transactions_db.update_transaction_state(transaction_id, answer_command)
+
+            case 'PRECOMMIT':
+                transaction_id = message.get('GTID')
+                self.transactions_db.update_transaction_state(transaction_id, command)
+                transaction = message.get('data').get('transaction')
+                check_result, check_text = self.transactions_db.check_transaction(transaction)
+                if not check_result:
+                    logger.warning(f'{self.__client_indent}{self.name}. Transaction denied: {check_text}')
+                    self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+                    answer_command = 'DENY'
+                else:
+                    self.transactions_db.save_to_binlog(transaction_id, transaction)
+                    self.transactions_db.update_transaction_state(transaction_id, answer_command)
+
+            case 'COMMIT':
+                transaction_id = message.get('GTID')
+                self.transactions_db.update_transaction_state(transaction_id, command)
+                self.transactions_db.commit_transaction(transaction_id)
+                self.transactions_db.update_transaction_state(transaction_id, answer_command)
+                logger.exception(f'{self.__client_indent}{self.name}. Transaction commited: {transaction_id}', exc_info=False)
+
+            case 'ABORT':
+                transaction_id = message.get('GTID')
+                state = self.transactions_db.get_transaction_state(transaction_id)
+                if state in ('PRECOMMIT', 'PRECOMMITED', 'COMMIT'):
+                    self.transactions_db.delete_from_binlog(transaction_id)
+                self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
+
         message: dict = {
             **message,
             'UUID': self.uuid,
             'COMMAND': answer_command,
             'data': answer_data,
         }
-        logger.warning(f'\t\t\t\t{self.name}. Send\t\t{message['COMMAND']}.\tTo {addr}.\t\t({message})')
+        self.client_log(message['COMMAND'], addr, message, received=False)
         writer.write(orjson.dumps(message))
         await writer.drain()
         writer.close()
@@ -157,5 +341,5 @@ class Server(Process):
             await server.serve_forever()
 
     def run(self):
-        logger.warning(f'Starting server with id: {self.uuid} address: {self.address}')
+        logger.warning(f'Starting server {self.name} with id: {self.uuid} address: {self.address}')
         asyncio.run(self.start_server())

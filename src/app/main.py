@@ -4,6 +4,27 @@ from src.app.server import Server
 from schemas import Address
 
 
+FIRST_TRANACTION = """
+UPDATE accounts SET balance = balance - 100.00
+    WHERE name = 'Alice';
+UPDATE branches SET balance = balance - 100.00
+    WHERE name = (SELECT branch_name FROM accounts WHERE name = 'Alice');
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Bob';
+"""
+
+SECOND_TRANACTION = """
+UPDATE accounts SET balance = balance - 100.00
+    WHERE name = 'Alice';
+UPDATE branches SET balance = balance - 100.00
+    WHERE name = (SELECT branch_name FROM accounts WHERE name = 'Alice');
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Bob';
+UPDATE branches SET balance = balance + 100.00
+    WHERE name = (SELECT branch_name FROM accounts WHERE name = 'Bob');
+"""
+
+
 async def main():
     node1 = Server(name='node1', address=Address(address='localhost', port=15001))
     node2 = Server(name='node2', address=Address(address='localhost', port=15002))
@@ -16,6 +37,11 @@ async def main():
 
     await node1.add_node(node2.address)
     await node1.add_node(node3.address)
+
+    for node in nodes:
+        print(node.info_nodes())
+
+    await node2.commit_transaction(FIRST_TRANACTION)
 
     for node in nodes:
         print(node.info_nodes())
