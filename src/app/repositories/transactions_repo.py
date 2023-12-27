@@ -64,6 +64,15 @@ class TransactionsRepository:
             )
             return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
+    def get_full_transactions(self) -> dict[str, tuple[str, ...]]:
+        with self.transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT gtid, coordinator_id, transaction_state, transaction_text FROM transaction_table
+                """
+            )
+            return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+
     def check_transaction(self, transaction: str) -> tuple[bool, str | None]:
         if len(transaction) > 270:
             return False, 'Conflict with transaction'
@@ -122,6 +131,16 @@ class TransactionsRepository:
             cursor.close()
 
         return result.lastrowid
+
+    def delete_transaction(self, gtid: str) -> None:
+        with self.transaction() as cursor:
+            result: Cursor = cursor.execute(
+                """
+                DELETE FROM transaction_table WHERE gtid = :gtid
+                """,
+                {"gtid": gtid},
+            )
+            cursor.close()
 
     def get_transaction_from_binlog(self, gtid: UUID) -> str:
         with self.transaction() as cursor:

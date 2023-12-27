@@ -1,4 +1,5 @@
 import asyncio
+import os
 from uuid import uuid4, UUID
 from multiprocessing import Process
 
@@ -27,8 +28,8 @@ class Server(Process):
         self.name = name
         self.address: Address = address
         self.uuid: UUID = uuid4()
-        self.__timeout: int = 10
-        self.__failure_count: int = 5
+        self.__timeout: int = 5
+        self.__failure_count: int = 0
 
         self.__client_indent = '\t\t\t\t\t\t\t'
         self.__len_command_field = 15
@@ -69,8 +70,8 @@ class Server(Process):
         writer.write(orjson.dumps(message))
 
         try:
-            data = await asyncio.wait_for(reader.read(1000), self.__timeout)
-        except asyncio.TimeoutError:
+            data = await asyncio.wait_for(reader.read(2000), self.__timeout)
+        except (asyncio.TimeoutError, ConnectionResetError):
             logger.warning(f'{self.name}. Timeout from {node_address}')
             raise TimeoutError
         else:
@@ -94,6 +95,7 @@ class Server(Process):
 
         new_node_id = message.get('UUID')
         nodes = self.nodes_db.get_nodes()
+        transactions = self.transactions_db.get_full_transactions()
 
         message: dict = {
             'UUID': self.uuid,
@@ -103,6 +105,8 @@ class Server(Process):
         }
         if nodes:
             message['data']['nodes'] = {node: address.model_dump_json() for node, address in nodes.items()}
+        if transactions:
+            message['data']['transactions'] = transactions
         try:
             await self.__send_receive(message, new_node_address)
         except TimeoutError:
@@ -116,7 +120,7 @@ class Server(Process):
         }
         for node_id, node_address in nodes.items():
             try:
-                message = await self.__send_receive(message, node_address)
+                await self.__send_receive(message, node_address)
             except TimeoutError:
                 continue
 
@@ -142,7 +146,7 @@ class Server(Process):
         }
         try:
             await self.__send_receive(message, deleted_node_address)
-        except TimeoutError:
+        except (TimeoutError, ConnectionRefusedError):
             pass
 
         nodes = self.nodes_db.get_nodes()
@@ -158,7 +162,7 @@ class Server(Process):
                 continue
 
             try:
-                message = await self.__send_receive(message, node_address)
+                await self.__send_receive(message, node_address)
             except TimeoutError:
                 pass
 
@@ -166,7 +170,7 @@ class Server(Process):
 
     async def timeout_node_handler(self, node_id: str, node_address: Address) -> None:
         failure_count = self.nodes_db.get_node_failure_count(node_id)
-        if failure_count > self.__failure_count:
+        if failure_count == self.__failure_count:
             await self.delete_node(node_id, node_address)
         else:
             self.nodes_db.update_node_failure_count(node_id, failure_count + 1)
@@ -249,7 +253,7 @@ class Server(Process):
         logger.exception(f'{self.name}. Transaction commited.', exc_info=False)
 
     async def handle_commands(self, reader, writer):
-        data = await reader.read(1000)
+        data = await reader.read(2000)
         message = orjson.loads(data)
         addr = writer.get_extra_info('peername')
         self.client_log(message['COMMAND'], addr, message, received=True)
@@ -269,6 +273,10 @@ class Server(Process):
                 for uuid, address in nodes.items():
                     self.nodes_db.insert_node(uuid, Address.model_validate(orjson.loads(address)))
 
+                transactions = message_data.get('transactions', {})
+                for uuid, (coordinator_id, state, transaction_text) in transactions.items():
+                    self.transactions_db.insert_transaction(uuid, coordinator_id, state, transaction_text)
+
                 answer_data = None
             case 'JOIN_NODE':
                 node_id = message.get('UUID_NEW_NODE')
@@ -277,23 +285,27 @@ class Server(Process):
                 answer_data = None
 
             case 'DELETE_NODE':
-                node_id = message.get('UUID_NEW_NODE')
+                node_id = message.get('UUID_NODE')
                 if node_id != self.uuid:
                     self.nodes_db.delete_node(node_id)
 
             case 'PREPARE':
+                coordinator_id = message.get('UUID')
                 transaction_id = message.get('GTID')
                 transaction = message.get('data').get('transaction')
-                self.transactions_db.insert_transaction(transaction_id, self.uuid, command, transaction)
+                self.transactions_db.insert_transaction(transaction_id, coordinator_id, command, transaction)
                 check_result, check_text = self.transactions_db.check_transaction(transaction)
-                if not check_result:
-                    logger.warning(f'{self.__client_indent}{self.name}. Transaction denied: {check_text}')
+                if not check_result or self.name == 'node5':
+                    logger.warning(f'{self.__client_indent}{self.name}. Transaction denied: transaction conflict')
                     self.transactions_db.update_transaction_state(transaction_id, 'ABORTED')
                     answer_command = 'DENY'
                 else:
                     self.transactions_db.update_transaction_state(transaction_id, answer_command)
 
             case 'PRECOMMIT':
+                if self.name == 'node4':
+                    self.stop()
+                    return None
                 transaction_id = message.get('GTID')
                 self.transactions_db.update_transaction_state(transaction_id, command)
                 transaction = message.get('data').get('transaction')
@@ -343,3 +355,7 @@ class Server(Process):
     def run(self):
         logger.warning(f'Starting server {self.name} with id: {self.uuid} address: {self.address}')
         asyncio.run(self.start_server())
+
+    def stop(self):
+        logger.warning(f'Stopped server {self.name} with id: {self.uuid} address: {self.address}')
+        os.kill(os.getpid(), 9)
